@@ -1,5 +1,6 @@
-"""Non-command message handlers (OTP input, channel selection, link paste)"""
+"""Message handlers (Link paste + Auto Delete + Auto Copy to Current Chat)"""
 import re
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.handlers import MessageHandler
@@ -10,32 +11,31 @@ from core.copy_engine import copy_engine
 from core.bandwidth import bandwidth
 from utils.logger import logger
 
+# Supports single link: https://t.me/channel/123 or range: https://t.me/channel/10-20
+# Also supports private links: https://t.me/c/1234567890/123
+TG_LINK_PATTERN = re.compile(
+    r"https?://t\.me/(?:c/)?([\w\d_]+)/(\d+)(?:-(\d+))?"
+)
 
-# ==================== LOGIN FLOW MESSAGES ====================
 
 async def handle_login_input(client: Client, message: Message):
-    """Handle phone number, OTP code, and 2FA password inputs"""
-    user_id = message.from_user.id
+    """Handle login input only in private chat"""
+    if message.chat.type.name != "PRIVATE":
+        return
     
-    # Only owner/admin can login
+    user_id = permissions.get_user_id(message)
     if not permissions.is_admin_or_higher(user_id):
         return
     
     text = message.text.strip()
-    
-    # Ignore commands
     if text.startswith("/"):
         return
     
     state = session_mgr.login_state
     
     if state == SessionState.AWAITING_PHONE:
-        # Expecting phone number
         if not text.startswith("+"):
-            await message.reply_text(
-                "❌ Phone number must start with + and country code.\n"
-                "Example: `+919876543210`"
-            )
+            await message.reply_text("❌ Number format: `+919876543210`")
             return
         
         status_msg = await message.reply_text("📤 Sending OTP...")
@@ -43,181 +43,111 @@ async def handle_login_input(client: Client, message: Message):
         await status_msg.edit_text(f"{'✅' if success else '❌'} {msg_text}")
     
     elif state == SessionState.AWAITING_CODE:
-        # Expecting OTP code
         clean_code = text.replace(" ", "").replace("-", "").strip()
-        if not clean_code.isdigit():
-            await message.reply_text("❌ Code should be numeric.")
-            return
-        
         status_msg = await message.reply_text("🔐 Verifying code...")
         success, msg_text = await session_mgr.verify_code(clean_code)
         await status_msg.edit_text(f"{'✅' if success else '❌'} {msg_text}")
     
     elif state == SessionState.AWAITING_PASSWORD:
-        # Expecting 2FA password
         try:
-            await message.delete()  # Delete password for security
+            await message.delete()
         except Exception:
             pass
-        
-        status_msg = await client.send_message(
-            message.chat.id, "🔐 Checking password..."
-        )
+        status_msg = await client.send_message(message.chat.id, "🔐 Verifying 2FA...")
         success, msg_text = await session_mgr.verify_password(text)
         await status_msg.edit_text(f"{'✅' if success else '❌'} {msg_text}")
 
 
-# ==================== CHANNEL SELECTION ====================
-
-async def handle_channel_selection(client: Client, message: Message):
-    """Handle numeric input when selecting from search results"""
-    user_id = message.from_user.id
-    
-    if not permissions.is_admin_or_higher(user_id):
-        return
-    
-    text = message.text.strip()
-    
-    if not text.isdigit():
-        return
-    
-    if not channel_mgr.pending_search_results:
-        return
-    
-    idx = int(text) - 1
-    if idx < 0 or idx >= len(channel_mgr.pending_search_results):
-        await message.reply_text(
-            f"❌ Invalid choice. Pick 1 to {len(channel_mgr.pending_search_results)}."
-        )
-        return
-    
-    chat = channel_mgr.pending_search_results[idx]
-    selection_type = channel_mgr.pending_search_type
-    
-    # Clear pending
-    channel_mgr.pending_search_results = []
-    channel_mgr.pending_search_type = None
-    
-    if selection_type == "source":
-        channel_mgr.set_source(chat)
-        await message.reply_text(
-            f"✅ **Source Connected!**\n\n"
-            f"📥 {chat.title}\n"
-            f"🆔 `{chat.id}`\n\n"
-            f"Use /analyze to scan content."
-        )
-    elif selection_type == "destination":
-        channel_mgr.set_destination(chat)
-        await message.reply_text(
-            f"✅ **Destination Set!**\n\n"
-            f"📤 {chat.title}\n"
-            f"🆔 `{chat.id}`"
-        )
-
-
-# ==================== TELEGRAM LINK COPY ====================
-
-TG_LINK_PATTERN = re.compile(
-    r"https?://t\.me/(?:c/)?([\w\d_]+)/(\d+)"
-)
-
-
 async def handle_telegram_link(client: Client, message: Message):
-    """Handle pasted Telegram message links - copies that message"""
-    user_id = message.from_user.id
-    
-    if not permissions.is_admin_or_higher(user_id):
-        return
-    
-    text = message.text or ""
+    """Handle link pasted in Channel, Group, or DM"""
+    text = message.text or message.caption or ""
     matches = TG_LINK_PATTERN.findall(text)
     
     if not matches:
         return
     
+    user_id = permissions.get_user_id(message)
+    if not permissions.is_authorized(user_id):
+        return
+
+    # Delete the command / link message immediately
+    dest_chat_id = message.chat.id
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete link message: {e}")
+
     if not session_mgr.is_logged_in:
-        await message.reply_text("❌ Please login first.")
+        temp = await client.send_message(dest_chat_id, "❌ Userbot is not logged in! Send `/session <string>` in Bot DM.")
+        await asyncio.sleep(5)
+        await temp.delete()
         return
-    
-    if not channel_mgr.destination_chat:
-        await message.reply_text("❌ Please set destination with /setdest first.")
-        return
-    
-    for chat_ref, msg_id_str in matches:
+
+    for chat_ref, start_id_str, end_id_str in matches:
         try:
-            msg_id = int(msg_id_str)
+            start_id = int(start_id_str)
+            end_id = int(end_id_str) if end_id_str else start_id
             
-            # Resolve chat
+            # Resolve source chat ID
             if chat_ref.isdigit():
-                # Private channel format: /c/12345/678
                 source_id = int(f"-100{chat_ref}")
             else:
-                # Public: /username/678
                 try:
                     chat = await session_mgr.user_client.get_chat(chat_ref)
                     source_id = chat.id
                 except Exception as e:
-                    await message.reply_text(f"❌ Cannot access {chat_ref}: {e}")
+                    temp = await client.send_message(dest_chat_id, f"❌ Cannot access `{chat_ref}`: {e}")
+                    await asyncio.sleep(5)
+                    await temp.delete()
                     continue
             
-            status_msg = await message.reply_text(f"⏳ Copying message {msg_id}...")
+            # Status placeholder
+            status_msg = await client.send_message(dest_chat_id, f"⏳ Extracting {start_id} to {end_id}...")
             
-            success, status_text, bytes_used = await copy_engine.copy_single_message(
-                user_client=session_mgr.user_client,
-                bot_client=client,
-                source_chat_id=source_id,
-                message_id=msg_id,
-                dest_chat_id=channel_mgr.destination_chat.id,
-            )
-            
-            if success:
-                await status_msg.edit_text(
-                    f"✅ **Copied!**\n"
-                    f"📊 {status_text}\n"
-                    f"💾 Bandwidth: `{bytes_used / (1024*1024):.2f} MB`"
+            total_copied = 0
+            for msg_id in range(start_id, end_id + 1):
+                success, status_text, bytes_used = await copy_engine.copy_single_message(
+                    user_client=session_mgr.user_client,
+                    bot_client=client,
+                    source_chat_id=source_id,
+                    message_id=msg_id,
+                    dest_chat_id=dest_chat_id,
                 )
-            else:
-                await status_msg.edit_text(f"❌ Failed: {status_text}")
-        
+                if success:
+                    total_copied += 1
+                await asyncio.sleep(0.5)
+            
+            # Delete temporary processing message
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+                
         except Exception as e:
             logger.error(f"Link copy error: {e}")
-            await message.reply_text(f"❌ Error: {e}")
 
-
-# ==================== REGISTER HANDLERS ====================
 
 def register_message_handlers(app: Client):
-    """Register all message (non-command) handlers"""
+    # Link handler (Handles channels, groups, and private chats)
+    app.add_handler(
+        MessageHandler(
+            handle_telegram_link,
+            filters.text & filters.regex(TG_LINK_PATTERN.pattern)
+        ),
+        group=1
+    )
     
-    # Login flow - text messages when in login state
+    # Private login inputs
     app.add_handler(
         MessageHandler(
             handle_login_input,
             filters.text & filters.private & ~filters.command([
                 "start", "help", "status", "login", "session", "logout",
                 "connect", "setdest", "disconnect", "analyze",
-                "copy", "v", "p", "d", "a", "pause", "resume", "stop", "skip",
-                "mode", "limit", "reset", "progress", "speed",
-                "adduser", "addadmin", "removeuser", "removeadmin",
-                "userlist", "broadcast", "cancel",
-            ]),
-        )
+                "copy", "v", "p", "d", "a", "pause", "resume", "stop", "skip"
+            ])
+        ),
+        group=2
     )
     
-    # Channel selection - numeric input
-    app.add_handler(
-        MessageHandler(
-            handle_channel_selection,
-            filters.text & filters.regex(r"^\d+$"),
-        )
-    )
-    
-    # Telegram link paste
-    app.add_handler(
-        MessageHandler(
-            handle_telegram_link,
-            filters.text & filters.regex(TG_LINK_PATTERN.pattern),
-        )
-    )
-    
-    logger.info("Message handlers registered")
+    logger.info("Message & Link handlers registered")
