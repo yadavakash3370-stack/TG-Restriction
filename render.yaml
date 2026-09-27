@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: channel-copier-bot
+    env: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: BOT_SIGNATURE
+        value: "Extracted by @XyrDeveloper"
+      - key: BANDWIDTH_LIMIT_GB
+        value: "4.5"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
