@@ -1,4 +1,4 @@
-"""Copy engine - FIXED: always uses explicit dest_chat_id"""
+"""Copy engine - FIXED: accepts bot_client and kwargs gracefully"""
 import os
 import asyncio
 import time
@@ -38,10 +38,12 @@ class CopyEngine:
         source_chat_id: int,
         message_id: int,
         dest_chat_id: int,
+        bot_client: Optional[Client] = None,
+        **kwargs
     ) -> tuple:
         """
-        Copy one message. dest_chat_id MUST be the target channel.
-        Returns: (success, status_text, bytes_used)
+        Copy single message safely to dest_chat_id.
+        Returns: (success: bool, status_text: str, bytes_used: int)
         """
         try:
             src_msg = await user_client.get_messages(source_chat_id, message_id)
@@ -51,7 +53,7 @@ class CopyEngine:
             original_caption = src_msg.caption or ""
             new_caption = build_caption(original_caption)
 
-            # STEP 1: Native copy (zero bandwidth)
+            # STEP 1: Try native copy first (0 Bandwidth)
             try:
                 if src_msg.text and not src_msg.media:
                     await user_client.send_message(
@@ -65,10 +67,10 @@ class CopyEngine:
                         message_id=message_id,
                         caption=new_caption if src_msg.media else None,
                     )
-                return True, "Native copy", 0
+                return True, "Native copy successful", 0
 
             except ChatForwardsRestricted:
-                logger.info(f"Msg {message_id} restricted, trying download")
+                logger.info(f"Message {message_id} restricted, using download fallback")
 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
@@ -83,19 +85,19 @@ class CopyEngine:
                 except ChatForwardsRestricted:
                     pass
 
-            # STEP 2: Check bandwidth
+            # STEP 2: Check Bandwidth before downloading
             if not bandwidth.can_download():
-                return False, "BW limit reached - skipped", 0
+                return False, "Bandwidth limit reached - skipped", 0
 
-            # STEP 3: Download + Upload to DESTINATION
+            # STEP 3: Fallback Download + Upload
             return await self._download_upload(
                 user_client, src_msg, dest_chat_id, new_caption
             )
 
         except MessageIdInvalid:
-            return False, "Invalid msg ID", 0
+            return False, "Invalid message ID", 0
         except Exception as e:
-            logger.error(f"Copy failed {message_id}: {e}")
+            logger.error(f"Copy failed for msg {message_id}: {e}")
             return False, f"Error: {str(e)[:80]}", 0
 
     async def _download_upload(
@@ -105,11 +107,11 @@ class CopyEngine:
         dest_chat_id: int,
         caption: str,
     ) -> tuple:
-        """Download then upload to dest_chat_id (NOT 'me')"""
+        """Download to disk and re-upload to target destination"""
         file_path = None
         try:
             if not bandwidth.can_download():
-                return False, "BW limit", 0
+                return False, "Bandwidth limit", 0
 
             file_path = await user_client.download_media(
                 src_msg,
@@ -182,8 +184,7 @@ class CopyEngine:
                     os.remove(file_path)
                 except Exception:
                     pass
-
-    async def copy_range(
+                        async def copy_range(
         self,
         user_client: Client,
         source_chat_id: int,
@@ -192,7 +193,10 @@ class CopyEngine:
         end_id: int,
         filter_type: str = "all",
         status_message: Optional[Message] = None,
+        bot_client: Optional[Client] = None,
+        **kwargs
     ) -> ProgressTracker:
+        """Copy a range of messages from source to dest"""
         self.is_running = True
         self.reset_flags()
 
@@ -225,12 +229,16 @@ class CopyEngine:
                 continue
 
             progress.current_file = f"Msg {msg_id}"
-            success, _, bytes_used = await self.copy_single_message(
-                user_client, source_chat_id, msg_id, dest_chat_id
+            success, status_msg, bytes_used = await self.copy_single_message(
+                user_client=user_client,
+                source_chat_id=source_chat_id,
+                message_id=msg_id,
+                dest_chat_id=dest_chat_id,
+                bot_client=bot_client,
             )
             if success:
                 progress.increment_success(bytes_used)
-            elif "skipped" in _.lower() or "bw" in _.lower():
+            elif "skipped" in status_msg.lower() or "bandwidth" in status_msg.lower():
                 progress.increment_skipped()
             else:
                 progress.increment_failed()
@@ -239,8 +247,8 @@ class CopyEngine:
             if status_message and (now - last_update) > 5:
                 try:
                     await status_message.edit_text(
-                        f"⏳ **Copying...**\n\n{progress.format_summary()}\n\n"
-                        f"/pause /resume /stop /skip"
+                        f"⏳ **Copying in progress...**\n\n{progress.format_summary()}\n\n"
+                        f"Controls: /pause /resume /stop /skip"
                     )
                     last_update = now
                 except Exception:
@@ -259,7 +267,10 @@ class CopyEngine:
         filter_type: str = "all",
         status_message: Optional[Message] = None,
         limit: int = 0,
+        bot_client: Optional[Client] = None,
+        **kwargs
     ) -> ProgressTracker:
+        """Copy all messages from source channel"""
         self.is_running = True
         self.reset_flags()
 
@@ -285,11 +296,17 @@ class CopyEngine:
                 progress.increment_skipped()
                 continue
 
-            success, _, bytes_used = await self.copy_single_message(
-                user_client, source_chat_id, msg_id, dest_chat_id
+            success, status_msg, bytes_used = await self.copy_single_message(
+                user_client=user_client,
+                source_chat_id=source_chat_id,
+                message_id=msg_id,
+                dest_chat_id=dest_chat_id,
+                bot_client=bot_client,
             )
             if success:
                 progress.increment_success(bytes_used)
+            elif "skipped" in status_msg.lower() or "bandwidth" in status_msg.lower():
+                progress.increment_skipped()
             else:
                 progress.increment_failed()
 
@@ -297,7 +314,8 @@ class CopyEngine:
             if status_message and (now - last_update) > 5:
                 try:
                     await status_message.edit_text(
-                        f"⏳ **Copying...**\n\n{progress.format_summary()}"
+                        f"⏳ **Copying in progress...**\n\n{progress.format_summary()}\n\n"
+                        f"Controls: /pause /resume /stop /skip"
                     )
                     last_update = now
                 except Exception:
