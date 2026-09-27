@@ -1,10 +1,11 @@
 """
 Channel Copier Bot - Main Entry Point
-Handles bot startup, web server for Render, and graceful shutdown.
+Auto-restore session, channels, bandwidth on restart.
+Web server for Render health checks.
 """
 import asyncio
-import os
 import sys
+import os
 from aiohttp import web
 from pyrogram import Client
 
@@ -18,32 +19,37 @@ from config import (
     validate_config,
 )
 from utils.logger import logger
+from auth.session_manager import session_mgr
+from core.channel_manager import channel_mgr
+from core.bandwidth import bandwidth
 from handlers.commands import register_command_handlers
 from handlers.messages import register_message_handlers
 from handlers.callbacks import register_callback_handlers
 
-# Use uvloop for better performance on Linux
+# Use uvloop for better async performance on Linux
 try:
     import uvloop
     uvloop.install()
-    logger.info("Using uvloop for asyncio")
+    logger.info("uvloop enabled")
 except ImportError:
-    logger.info("uvloop not available, using default event loop")
+    logger.info("uvloop not available, using default loop")
 
 
-# ==================== WEB SERVER (for Render) ====================
+# ==================== WEB SERVER (Render Health Check) ====================
 
 async def health_check(request):
-    """Health check endpoint for Render"""
+    """Render pings this every few minutes to keep bot alive"""
     return web.json_response({
         "status": "ok",
         "bot": "Channel Copier Bot",
-        "version": "1.0.0",
+        "logged_in": session_mgr.is_logged_in,
+        "source": channel_mgr.source_chat.title if channel_mgr.source_chat else None,
+        "destination": channel_mgr.destination_chat.title if channel_mgr.destination_chat else None,
     })
 
 
 async def root_handler(request):
-    """Root endpoint"""
+    """Root URL handler"""
     return web.Response(
         text="Channel Copier Bot is running!\nMade by @XyrDeveloper",
         content_type="text/plain",
@@ -51,49 +57,104 @@ async def root_handler(request):
 
 
 async def start_web_server():
-    """Start the aiohttp web server for Render health checks"""
+    """Start aiohttp web server on PORT for Render"""
     app = web.Application()
     app.router.add_get("/", root_handler)
     app.router.add_get("/health", health_check)
-    
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"Web server started on port {PORT}")
     return runner
+    # ==================== AUTO RESTORE ON STARTUP ====================
+
+async def auto_restore(bot: Client):
+    """
+    Restore all saved data after restart:
+    1. Bandwidth counter from file
+    2. Channel IDs from settings.json
+    3. User session from session file
+    4. Reconnect source & destination chats
+    """
+    logger.info("Starting auto-restore...")
+
+    # Step 1: Load bandwidth
+    bandwidth.load_from_file()
+    logger.info(f"Bandwidth restored: {bandwidth.bytes_used} bytes used")
+
+    # Step 2: Load channel settings (IDs only)
+    channel_mgr.load_settings()
+    logger.info(f"Settings loaded - Source ID: {channel_mgr._source_id}, Dest ID: {channel_mgr._dest_id}")
+
+    # Step 3: Auto-login userbot from saved session file
+    login_ok = await session_mgr.auto_login_from_file()
+
+    if login_ok:
+        logger.info("Userbot auto-login successful")
+
+        # Step 4: Restore chat objects from saved IDs
+        await channel_mgr.restore_chats(session_mgr.user_client)
+
+        src_name = channel_mgr.source_chat.title if channel_mgr.source_chat else "None"
+        dst_name = channel_mgr.destination_chat.title if channel_mgr.destination_chat else "None"
+        logger.info(f"Channels restored - Source: {src_name}, Dest: {dst_name}")
+    else:
+        logger.warning("Userbot auto-login failed. Owner needs to /session or /login again.")
+
+    return login_ok
 
 
-# ==================== BOT STARTUP ====================
+# ==================== OWNER NOTIFICATION ====================
 
-async def startup_notify(bot: Client):
-    """Send a startup notification to the owner"""
+async def notify_owner(bot: Client, login_ok: bool):
+    """Send startup status to owner's DM"""
     try:
+        if login_ok:
+            login_status = "✅ Auto-login successful"
+        else:
+            login_status = "⚠️ Login needed — send /session or /login"
+
+        src = "❌ None"
+        if channel_mgr.source_chat:
+            src = f"✅ {channel_mgr.source_chat.title}"
+
+        dst = "❌ None"
+        if channel_mgr.destination_chat:
+            dst = f"✅ {channel_mgr.destination_chat.title}"
+
         await bot.send_message(
             OWNER_ID,
-            "🚀 **Bot Started!**\n\n"
-            "✅ Server is running\n"
-            "⚠️ Please login using /login or /session\n\n"
-            "Use /help to see available commands.",
+            f"🚀 **Bot Restarted Successfully!**\n\n"
+            f"🔐 Session: {login_status}\n"
+            f"📥 Source: {src}\n"
+            f"📤 Destination: {dst}\n\n"
+            f"{bandwidth.format_status()}\n\n"
+            f"💡 All settings restored from file.\n"
+            f"— Extracted by @XyrDeveloper",
         )
+        logger.info("Owner notified")
     except Exception as e:
         logger.warning(f"Could not notify owner: {e}")
 
 
+# ==================== MAIN ENTRY POINT ====================
+
 async def main():
-    """Main entry point"""
+    """Main function - starts everything"""
     logger.info("=" * 50)
-    logger.info("Channel Copier Bot Starting...")
+    logger.info("  Channel Copier Bot Starting...")
     logger.info("=" * 50)
-    
-    # Validate config
+
+    # Validate environment variables
     try:
         validate_config()
-        logger.info("Configuration validated")
+        logger.info("Configuration validated successfully")
     except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+        logger.error(f"FATAL: {e}")
         sys.exit(1)
-    
+
     # Create bot client
     bot = Client(
         name=BOT_SESSION_NAME,
@@ -102,34 +163,45 @@ async def main():
         bot_token=BOT_TOKEN,
         in_memory=True,
     )
-    
+
     # Register all handlers
     register_command_handlers(bot)
     register_message_handlers(bot)
     register_callback_handlers(bot)
-    
-    # Start web server (for Render)
+    logger.info("All handlers registered")
+
+    # Start web server (keeps Render awake)
     web_runner = await start_web_server()
-    
-    # Start bot
+
+    # Start the bot
     await bot.start()
     me = await bot.get_me()
     logger.info(f"Bot started as @{me.username} (ID: {me.id})")
-    
-    # Notify owner
-    await startup_notify(bot)
-    
-    # Keep running
+
+    # Auto-restore everything from files
+    login_ok = await auto_restore(bot)
+
+    # Notify owner about restart status
+    await notify_owner(bot, login_ok)
+
+    # Keep running forever
+    logger.info("Bot is now running and listening...")
     try:
-        # Idle - keeps the event loop alive
         stop_event = asyncio.Event()
         await stop_event.wait()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down...")
+        logger.info("Shutdown signal received")
     finally:
+        # Cleanup
+        logger.info("Cleaning up...")
+        try:
+            if session_mgr.user_client:
+                await session_mgr.user_client.stop()
+        except Exception:
+            pass
         await bot.stop()
         await web_runner.cleanup()
-        logger.info("Bot stopped")
+        logger.info("Bot stopped gracefully")
 
 
 if __name__ == "__main__":
@@ -137,3 +209,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
