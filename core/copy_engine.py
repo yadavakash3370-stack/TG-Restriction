@@ -1,4 +1,4 @@
-"""Copy engine - FIXED: accepts bot_client and kwargs gracefully"""
+"""Copy engine - Handles native copy and download+upload fallback"""
 import os
 import asyncio
 import time
@@ -10,7 +10,7 @@ from utils.logger import logger
 from utils.caption import build_caption
 from utils.progress import ProgressTracker
 from core.bandwidth import bandwidth
-from core.filters import matches_filter, get_file_size, detect_content_type, ContentType
+from core.filters import matches_filter, detect_content_type, ContentType
 
 
 class CopyEngine:
@@ -42,7 +42,7 @@ class CopyEngine:
         **kwargs
     ) -> tuple:
         """
-        Copy single message safely to dest_chat_id.
+        Copy single message to target destination.
         Returns: (success: bool, status_text: str, bytes_used: int)
         """
         try:
@@ -53,7 +53,7 @@ class CopyEngine:
             original_caption = src_msg.caption or ""
             new_caption = build_caption(original_caption)
 
-            # STEP 1: Try native copy first (0 Bandwidth)
+            # STEP 1: Native Copy (Zero Bandwidth)
             try:
                 if src_msg.text and not src_msg.media:
                     await user_client.send_message(
@@ -85,7 +85,7 @@ class CopyEngine:
                 except ChatForwardsRestricted:
                     pass
 
-            # STEP 2: Check Bandwidth before downloading
+            # STEP 2: Bandwidth Check
             if not bandwidth.can_download():
                 return False, "Bandwidth limit reached - skipped", 0
 
@@ -184,7 +184,8 @@ class CopyEngine:
                     os.remove(file_path)
                 except Exception:
                     pass
-                        async def copy_range(
+
+    async def copy_range(
         self,
         user_client: Client,
         source_chat_id: int,
