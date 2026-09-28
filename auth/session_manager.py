@@ -1,5 +1,4 @@
-
-"""Session manager with FILE-BASED persistence (survives restart)"""
+"""Session manager - Auto-loads from Render Env Var or File"""
 import os
 from typing import Optional
 from pyrogram import Client
@@ -11,7 +10,7 @@ from pyrogram.errors import (
 )
 from config import (
     API_ID, API_HASH, USER_SESSION_NAME,
-    SESSION_FILE, DATA_DIR,
+    SESSION_FILE, SESSION_STRING,
 )
 from utils.logger import logger
 
@@ -34,54 +33,39 @@ class UserSessionManager:
         self.temp_client: Optional[Client] = None
 
     def _save_session_string(self, session_string: str):
-        """Save session string to file for persistence"""
         try:
             with open(SESSION_FILE, "w") as f:
                 f.write(session_string)
-            logger.info("Session string saved to file")
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
 
     def _load_session_string(self) -> Optional[str]:
-        """Load session string from file"""
+        # 1. First priority: Render Environment Variable (NEVER RESETS!)
+        if SESSION_STRING and len(SESSION_STRING.strip()) > 20:
+            logger.info("Found SESSION_STRING in Environment Variables")
+            return SESSION_STRING.strip()
+
+        # 2. Second priority: Local file
         try:
             if os.path.exists(SESSION_FILE):
                 with open(SESSION_FILE, "r") as f:
                     session = f.read().strip()
                 if session:
-                    logger.info("Session string loaded from file")
                     return session
         except Exception as e:
             logger.error(f"Failed to load session: {e}")
         return None
 
-    def _delete_session_file(self):
-        """Delete saved session"""
-        try:
-            if os.path.exists(SESSION_FILE):
-                os.remove(SESSION_FILE)
-                logger.info("Session file deleted")
-        except Exception:
-            pass
-
     async def auto_login_from_file(self) -> bool:
-        """Auto-login from saved session file on startup"""
         session_string = self._load_session_string()
         if not session_string:
             logger.info("No saved session found")
             return False
 
         success, msg = await self.login_with_session_string(session_string)
-        if success:
-            logger.info("Auto-login successful from saved session")
-            return True
-        else:
-            logger.warning(f"Auto-login failed: {msg}")
-            self._delete_session_file()
-            return False
+        return success
 
     async def login_with_session_string(self, session_string: str) -> tuple:
-        """Login using session string + save to file"""
         try:
             if self.user_client:
                 await self.logout()
@@ -105,9 +89,7 @@ class UserSessionManager:
                 "phone": me.phone_number,
             }
 
-            # SAVE to file for persistence
             self._save_session_string(session_string)
-
             logger.info(f"Logged in: {self.account_info['name']}")
             return True, f"Logged in as {self.account_info['name']}"
 
@@ -169,7 +151,6 @@ class UserSessionManager:
             self.pending_phone = None
             self.pending_phone_code_hash = None
 
-            # Export and save session string
             try:
                 session_string = await self.user_client.export_session_string()
                 self._save_session_string(session_string)
@@ -204,7 +185,6 @@ class UserSessionManager:
             }
 
             self.login_state = SessionState.IDLE
-
             try:
                 session_string = await self.user_client.export_session_string()
                 self._save_session_string(session_string)
@@ -231,7 +211,8 @@ class UserSessionManager:
             self.is_logged_in = False
             self.account_info = {}
             self.login_state = SessionState.IDLE
-            self._delete_session_file()
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
 
             return True, "Logged out."
         except Exception as e:
