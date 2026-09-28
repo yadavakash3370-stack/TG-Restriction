@@ -1,4 +1,4 @@
-"""Message handlers - FIXED: uses destination_chat for copy"""
+"""Message handlers - STRICT destination check (Never dumps to Saved Messages)"""
 import re
 import asyncio
 from pyrogram import Client, filters
@@ -49,7 +49,7 @@ async def handle_login_input(client: Client, message: Message):
 
 
 async def handle_telegram_link(client: Client, message: Message):
-    """Link paste handler - copies to DESTINATION channel"""
+    """Link paste handler - strictly sends to Destination Channel"""
     text = message.text or message.caption or ""
     matches = TG_LINK_PATTERN.findall(text)
     if not matches:
@@ -59,21 +59,38 @@ async def handle_telegram_link(client: Client, message: Message):
     if not permissions.is_authorized(user_id):
         return
 
-    # Get destination - ALWAYS use destination_chat, not message.chat
-    dest_chat_id = channel_mgr.get_destination_id()
-    if not dest_chat_id:
-        # Fallback: use current chat only if no destination set
-        dest_chat_id = message.chat.id
-
-    # Delete the link message
+    # Delete the user's link message
     try:
         await message.delete()
     except Exception:
         pass
 
+    # Destination resolution:
+    # 1. If posted directly in a Channel/Supergroup, destination IS that chat.
+    # 2. If posted in Bot DM, destination MUST be channel_mgr.get_destination_id()
+    if message.chat.type.name in ("CHANNEL", "SUPERGROUP"):
+        dest_chat_id = message.chat.id
+    else:
+        dest_chat_id = channel_mgr.get_destination_id()
+
+    # STRICT CHECK: Do not allow sending to a user ID / Saved Messages
+    if not dest_chat_id or (isinstance(dest_chat_id, int) and dest_chat_id > 0):
+        temp = await client.send_message(
+            message.chat.id,
+            "❌ **Destination Channel is not set!**\n\n"
+            "Please use `/setdest @yourchannel` or set `DESTINATION_CHANNEL` in Render environment variables.\n"
+            "(Bot cannot dump files into Saved Messages)"
+        )
+        await asyncio.sleep(8)
+        try:
+            await temp.delete()
+        except Exception:
+            pass
+        return
+
     if not session_mgr.is_logged_in:
-        temp = await client.send_message(dest_chat_id, "❌ Not logged in! Use /session in DM.")
-        await asyncio.sleep(5)
+        temp = await client.send_message(message.chat.id, "❌ Not logged in! Use /session in DM.")
+        await asyncio.sleep(6)
         try:
             await temp.delete()
         except Exception:
@@ -92,8 +109,8 @@ async def handle_telegram_link(client: Client, message: Message):
                     chat = await session_mgr.user_client.get_chat(chat_ref)
                     source_id = chat.id
                 except Exception as e:
-                    temp = await client.send_message(dest_chat_id, f"❌ Can't access `{chat_ref}`")
-                    await asyncio.sleep(5)
+                    temp = await client.send_message(message.chat.id, f"❌ Can't access source `{chat_ref}`: {e}")
+                    await asyncio.sleep(6)
                     try:
                         await temp.delete()
                     except Exception:
@@ -101,7 +118,7 @@ async def handle_telegram_link(client: Client, message: Message):
                     continue
 
             status_msg = await client.send_message(
-                dest_chat_id, f"⏳ Extracting {start_id}-{end_id}..."
+                dest_chat_id, f"⏳ Extracting {start_id} to {end_id}..."
             )
 
             copied = 0
@@ -110,14 +127,14 @@ async def handle_telegram_link(client: Client, message: Message):
                     user_client=session_mgr.user_client,
                     source_chat_id=source_id,
                     message_id=msg_id,
-                    dest_chat_id=dest_chat_id,  # FIXED: explicit destination
+                    dest_chat_id=dest_chat_id,
                 )
                 if success:
                     copied += 1
                 await asyncio.sleep(0.5)
 
             try:
-                await status_msg.edit_text(f"✅ Done! {copied} copied.")
+                await status_msg.edit_text(f"✅ Extraction completed! ({copied} items)")
                 await asyncio.sleep(5)
                 await status_msg.delete()
             except Exception:
