@@ -1,10 +1,10 @@
-"""Channel manager with FILE-BASED persistence"""
+"""Channel manager with Environment Variable fallback & Strict Channel Resolution"""
 import json
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 from pyrogram import Client
 from pyrogram.types import Chat
-from config import SETTINGS_FILE
+from config import SETTINGS_FILE, DESTINATION_CHANNEL, SOURCE_CHANNEL
 from utils.logger import logger
 from core.filters import detect_content_type, ContentType
 
@@ -17,12 +17,10 @@ class ChannelManager:
         self.pending_search_results: List[Chat] = []
         self.pending_search_type: Optional[str] = None
 
-        # Saved IDs (persisted)
-        self._source_id: Optional[int] = None
-        self._dest_id: Optional[int] = None
+        self._source_id: Optional[Union[int, str]] = None
+        self._dest_id: Optional[Union[int, str]] = None
 
     def save_settings(self):
-        """Save channel IDs to file"""
         data = {
             "source_id": self._source_id,
             "dest_id": self._dest_id,
@@ -30,44 +28,46 @@ class ChannelManager:
         try:
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(data, f)
-            logger.info(f"Settings saved: {data}")
         except Exception as e:
             logger.error(f"Save settings failed: {e}")
 
     def load_settings(self):
-        """Load channel IDs from file"""
+        # 1. Priority: Render Environment Variables
+        if DESTINATION_CHANNEL:
+            self._dest_id = int(DESTINATION_CHANNEL) if (DESTINATION_CHANNEL.startswith("-") or DESTINATION_CHANNEL.isdigit()) else DESTINATION_CHANNEL
+        if SOURCE_CHANNEL:
+            self._source_id = int(SOURCE_CHANNEL) if (SOURCE_CHANNEL.startswith("-") or SOURCE_CHANNEL.isdigit()) else SOURCE_CHANNEL
+
+        # 2. Priority: Local settings file
         try:
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, "r") as f:
                     data = json.load(f)
-                self._source_id = data.get("source_id")
-                self._dest_id = data.get("dest_id")
-                logger.info(f"Settings loaded: {data}")
+                if not self._source_id:
+                    self._source_id = data.get("source_id")
+                if not self._dest_id:
+                    self._dest_id = data.get("dest_id")
                 return True
         except Exception as e:
             logger.error(f"Load settings failed: {e}")
         return False
 
     async def restore_chats(self, client: Client):
-        """Restore chat objects from saved IDs after restart"""
+        self.load_settings()
+
         if self._source_id:
             try:
                 self.source_chat = await client.get_chat(self._source_id)
                 logger.info(f"Source restored: {self.source_chat.title}")
             except Exception as e:
                 logger.warning(f"Source restore failed: {e}")
-                self._source_id = None
 
         if self._dest_id:
             try:
                 self.destination_chat = await client.get_chat(self._dest_id)
-                logger.info(f"Destination restored: {self.destination_chat.title}")
+                logger.info(f"Destination restored: {self.destination_chat.title} ({self.destination_chat.id})")
             except Exception as e:
-                logger.warning(f"Destination restore failed: {e}")
-                self._dest_id = None
-
-        if self._source_id or self._dest_id:
-            self.save_settings()
+                logger.warning(f"Destination restore failed ({self._dest_id}): {e}")
 
     def set_source(self, chat: Chat):
         self.source_chat = chat
@@ -91,8 +91,7 @@ class ChannelManager:
         self._dest_id = None
         self.save_settings()
 
-    def get_destination_id(self) -> Optional[int]:
-        """Get destination chat ID safely"""
+    def get_destination_id(self) -> Optional[Union[int, str]]:
         if self.destination_chat:
             return self.destination_chat.id
         return self._dest_id
@@ -202,6 +201,8 @@ class ChannelManager:
         dst = "❌ Not set"
         if self.destination_chat:
             dst = f"✅ {self.destination_chat.title} (`{self.destination_chat.id}`)"
+        elif self._dest_id:
+            dst = f"⚠️ Target ID: `{self._dest_id}`"
         return (
             f"🔗 **Channels**\n"
             f"📥 Source: {src}\n"
