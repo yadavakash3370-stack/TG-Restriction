@@ -1,4 +1,4 @@
-"""Configuration - loads env vars + persistent data paths"""
+"""Configuration - supports Render Env Vars for permanent storage"""
 import os
 from dotenv import load_dotenv
 
@@ -9,6 +9,11 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
+# Permanent Session & Destination from Render Environment Variables
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+DESTINATION_CHANNEL = os.getenv("DESTINATION_CHANNEL", "")  # e.g., @mychannel or -1001234567890
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "")
+
 BOT_SIGNATURE = os.getenv("BOT_SIGNATURE", "Extracted by @XyrDeveloper")
 BANDWIDTH_LIMIT_GB = float(os.getenv("BANDWIDTH_LIMIT_GB", "4.5"))
 BANDWIDTH_LIMIT_BYTES = int(BANDWIDTH_LIMIT_GB * 1024 * 1024 * 1024)
@@ -18,7 +23,6 @@ PORT = int(os.getenv("PORT", "8080"))
 BOT_SESSION_NAME = "copier_bot"
 USER_SESSION_NAME = "copier_user"
 
-# Persistent storage directory (survives Render restart)
 DATA_DIR = os.getenv("DATA_DIR", "data")
 SESSION_FILE = os.path.join(DATA_DIR, "user_session.txt")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
